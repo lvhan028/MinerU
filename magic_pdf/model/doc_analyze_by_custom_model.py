@@ -3,6 +3,8 @@ import time
 import fitz
 import numpy as np
 from loguru import logger
+import torch
+from torch.profiler import profile, ProfilerActivity, schedule
 
 from magic_pdf.libs.config_reader import get_local_models_dir, get_device, get_table_recog_config
 from magic_pdf.model.model_list import MODEL
@@ -112,13 +114,19 @@ def doc_analyze(pdf_bytes: bytes, ocr: bool = False, show_log: bool = False):
 
     model_json = []
     doc_analyze_start = time.time()
-    for index, img_dict in enumerate(images):
-        img = img_dict["img"]
-        page_width = img_dict["width"]
-        page_height = img_dict["height"]
-        result = custom_model(img)
-        page_info = {"page_no": index, "height": page_height, "width": page_width}
-        page_dict = {"layout_dets": result, "page_info": page_info}
+    page_width = images[0]["width"]
+    page_height = images[0]["height"]
+    images = [img_dict["img"] for img_dict in images]
+    results = custom_model(images)
+
+    for page_no in range(len(images)):
+        page_info = {
+            "page_no": page_no, 
+            "height": page_height, 
+            "width": page_width
+        }
+        layout_dets = [result for result in results if result['image_id'] == page_no]
+        page_dict = {"layout_dets": layout_dets, "page_info": page_info}
         model_json.append(page_dict)
     doc_analyze_cost = time.time() - doc_analyze_start
     logger.info(f"doc analyze cost: {doc_analyze_cost}")
