@@ -3,8 +3,8 @@ import os
 import time
 from typing import List
 
-
 from magic_pdf.libs.Constants import *
+from magic_pdf.model.model_list import AtomicModel
 
 os.environ['NO_ALBUMENTATIONS_UPDATE'] = '1'  # 禁止albumentations检查更新
 try:
@@ -59,18 +59,27 @@ def mfd_model_init(weight):
 def mfr_model_init(weight_dir, cfg_path, _device_='cpu'):
     args = argparse.Namespace(cfg_path=cfg_path, options=None)
     cfg = Config(args)
-    cfg.config.model.pretrained = os.path.join(weight_dir, "pytorch_model.bin")
+    cfg.config.model.pretrained = os.path.join(weight_dir, "pytorch_model.pth")
     cfg.config.model.model_config.model_name = weight_dir
     cfg.config.model.tokenizer_config.path = weight_dir
     task = tasks.setup_task(cfg)
     model = task.build_model(cfg)
     model = model.to(_device_)
     vis_processor = load_processor('formula_image_eval', cfg.config.datasets.formula_rec_eval.vis_processor.eval)
-    return model, vis_processor
+    mfr_transform = transforms.Compose([vis_processor, ])
+    return [model, mfr_transform]
 
 
 def layout_model_init(weight, config_file, device):
     model = Layoutlmv3_Predictor(weight, config_file, device)
+    return model
+
+
+def ocr_model_init(show_log: bool = False, det_db_box_thresh=0.3, lang=None):
+    if lang is not None:
+        model = ModifiedPaddleOCR(show_log=show_log, det_db_box_thresh=det_db_box_thresh, lang=lang)
+    else:
+        model = ModifiedPaddleOCR(show_log=show_log, det_db_box_thresh=det_db_box_thresh)
     return model
 
 
@@ -91,6 +100,59 @@ class MathDataset(Dataset):
         if self.transform:
             image = self.transform(raw_image)
             return image
+
+
+class AtomModelSingleton:
+    _instance = None
+    _models = {}
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def get_atom_model(self, atom_model_name: str, **kwargs):
+        if atom_model_name not in self._models:
+            self._models[atom_model_name] = atom_model_init(model_name=atom_model_name, **kwargs)
+        return self._models[atom_model_name]
+
+
+def atom_model_init(model_name: str, **kwargs):
+
+    if model_name == AtomicModel.Layout:
+        atom_model = layout_model_init(
+            kwargs.get("layout_weights"),
+            kwargs.get("layout_config_file"),
+            kwargs.get("device")
+        )
+    elif model_name == AtomicModel.MFD:
+        atom_model = mfd_model_init(
+            kwargs.get("mfd_weights")
+        )
+    elif model_name == AtomicModel.MFR:
+        atom_model = mfr_model_init(
+            kwargs.get("mfr_weight_dir"),
+            kwargs.get("mfr_cfg_path"),
+            kwargs.get("device")
+        )
+    elif model_name == AtomicModel.OCR:
+        atom_model = ocr_model_init(
+            kwargs.get("ocr_show_log"),
+            kwargs.get("det_db_box_thresh"),
+            kwargs.get("lang")
+        )
+    elif model_name == AtomicModel.Table:
+        atom_model = table_model_init(
+            kwargs.get("table_model_type"),
+            kwargs.get("table_model_path"),
+            kwargs.get("table_max_time"),
+            kwargs.get("device")
+        )
+    else:
+        logger.error("model name not allow")
+        exit(1)
+
+    return atom_model
 
 
 class CustomPEKModel:
@@ -120,9 +182,10 @@ class CustomPEKModel:
         self.table_max_time = self.table_config.get("max_time", TABLE_MAX_TIME_VALUE)
         self.table_model_type = self.table_config.get("model", TABLE_MASTER)
         self.apply_ocr = ocr
+        self.lang = kwargs.get("lang", None)
         logger.info(
-            "DocAnalysis init, this may take some times. apply_layout: {}, apply_formula: {}, apply_ocr: {}, apply_table: {}".format(
-                self.apply_layout, self.apply_formula, self.apply_ocr, self.apply_table
+            "DocAnalysis init, this may take some times. apply_layout: {}, apply_formula: {}, apply_ocr: {}, apply_table: {}, lang: {}".format(
+                self.apply_layout, self.apply_formula, self.apply_ocr, self.apply_table, self.lang
             )
         )
         assert self.apply_layout, "DocAnalysis must contain layout model."
@@ -132,32 +195,63 @@ class CustomPEKModel:
         models_dir = kwargs.get("models_dir", os.path.join(root_dir, "resources", "models"))
         logger.info("using models_dir: {}".format(models_dir))
 
+        atom_model_manager = AtomModelSingleton()
+
         # 初始化公式识别
         if self.apply_formula:
             # 初始化公式检测模型
-            self.mfd_model = mfd_model_init(str(os.path.join(models_dir, self.configs["weights"]["mfd"])))
-
+            # self.mfd_model = mfd_model_init(str(os.path.join(models_dir, self.configs["weights"]["mfd"])))
+            self.mfd_model = atom_model_manager.get_atom_model(
+                atom_model_name=AtomicModel.MFD,
+                mfd_weights=str(os.path.join(models_dir, self.configs["weights"]["mfd"]))
+            )
             # 初始化公式解析模型
             mfr_weight_dir = str(os.path.join(models_dir, self.configs["weights"]["mfr"]))
             mfr_cfg_path = str(os.path.join(model_config_dir, "UniMERNet", "demo.yaml"))
-            self.mfr_model, mfr_vis_processors = mfr_model_init(mfr_weight_dir, mfr_cfg_path, _device_=self.device)
-            self.mfr_transform = transforms.Compose([mfr_vis_processors, ])
+            # self.mfr_model, mfr_vis_processors = mfr_model_init(mfr_weight_dir, mfr_cfg_path, _device_=self.device)
+            # self.mfr_transform = transforms.Compose([mfr_vis_processors, ])
+            self.mfr_model, self.mfr_transform = atom_model_manager.get_atom_model(
+                atom_model_name=AtomicModel.MFR,
+                mfr_weight_dir=mfr_weight_dir,
+                mfr_cfg_path=mfr_cfg_path,
+                device=self.device
+            )
 
         # 初始化layout模型
-        self.layout_model = Layoutlmv3_Predictor(
-            str(os.path.join(models_dir, self.configs['weights']['layout'])),
-            str(os.path.join(model_config_dir, "layoutlmv3", "layoutlmv3_base_inference.yaml")),
+        # self.layout_model = Layoutlmv3_Predictor(
+        #     str(os.path.join(models_dir, self.configs['weights']['layout'])),
+        #     str(os.path.join(model_config_dir, "layoutlmv3", "layoutlmv3_base_inference.yaml")),
+        #     device=self.device
+        # )
+        self.layout_model = atom_model_manager.get_atom_model(
+            atom_model_name=AtomicModel.Layout,
+            layout_weights=str(os.path.join(models_dir, self.configs['weights']['layout'])),
+            layout_config_file=str(os.path.join(model_config_dir, "layoutlmv3", "layoutlmv3_base_inference.yaml")),
             device=self.device
         )
         # 初始化ocr
         if self.apply_ocr:
-            self.ocr_model = ModifiedPaddleOCR(show_log=show_log)
 
+            # self.ocr_model = ModifiedPaddleOCR(show_log=show_log, det_db_box_thresh=0.3)
+            self.ocr_model = atom_model_manager.get_atom_model(
+                atom_model_name=AtomicModel.OCR,
+                ocr_show_log=show_log,
+                det_db_box_thresh=0.3,
+                lang=self.lang
+            )
         # init table model
         if self.apply_table:
             table_model_dir = self.configs["weights"][self.table_model_type]
-            self.table_model = table_model_init(self.table_model_type, str(os.path.join(models_dir, table_model_dir)),
-                                                max_time=self.table_max_time, _device_=self.device)
+            # self.table_model = table_model_init(self.table_model_type, str(os.path.join(models_dir, table_model_dir)),
+            #                                     max_time=self.table_max_time, _device_=self.device)
+            self.table_model = atom_model_manager.get_atom_model(
+                atom_model_name=AtomicModel.Table,
+                table_model_type=self.table_model_type,
+                table_model_path=str(os.path.join(models_dir, table_model_dir)),
+                table_max_time=self.table_max_time,
+                device=self.device
+            )
+
         logger.info('DocAnalysis init done!')
 
     def __call__(self, images):
@@ -223,106 +317,107 @@ class CustomPEKModel:
             elif int(res['category_id']) in [5]:
                 table_res_list.append(res)
 
-        # #  Unified crop img logic
-        # def crop_img(input_res, input_pil_img, crop_paste_x=0, crop_paste_y=0):
-        #     crop_xmin, crop_ymin = int(input_res['poly'][0]), int(input_res['poly'][1])
-        #     crop_xmax, crop_ymax = int(input_res['poly'][4]), int(input_res['poly'][5])
-        #     # Create a white background with an additional width and height of 50
-        #     crop_new_width = crop_xmax - crop_xmin + crop_paste_x * 2
-        #     crop_new_height = crop_ymax - crop_ymin + crop_paste_y * 2
-        #     return_image = Image.new('RGB', (crop_new_width, crop_new_height), 'white')
+        #  Unified crop img logic
+        def crop_img(input_res, input_pil_img, crop_paste_x=0, crop_paste_y=0):
+            crop_xmin, crop_ymin = int(input_res['poly'][0]), int(input_res['poly'][1])
+            crop_xmax, crop_ymax = int(input_res['poly'][4]), int(input_res['poly'][5])
+            # Create a white background with an additional width and height of 50
+            crop_new_width = crop_xmax - crop_xmin + crop_paste_x * 2
+            crop_new_height = crop_ymax - crop_ymin + crop_paste_y * 2
+            return_image = Image.new('RGB', (crop_new_width, crop_new_height), 'white')
 
-        #     # Crop image
-        #     crop_box = (crop_xmin, crop_ymin, crop_xmax, crop_ymax)
-        #     cropped_img = input_pil_img.crop(crop_box)
-        #     return_image.paste(cropped_img, (crop_paste_x, crop_paste_y))
-        #     return_list = [crop_paste_x, crop_paste_y, crop_xmin, crop_ymin, crop_xmax, crop_ymax, crop_new_width, crop_new_height]
-        #     return return_image, return_list
+            # Crop image
+            crop_box = (crop_xmin, crop_ymin, crop_xmax, crop_ymax)
+            cropped_img = input_pil_img.crop(crop_box)
+            return_image.paste(cropped_img, (crop_paste_x, crop_paste_y))
+            return_list = [crop_paste_x, crop_paste_y, crop_xmin, crop_ymin, crop_xmax, crop_ymax, crop_new_width, crop_new_height]
+            return return_image, return_list
 
-        # pil_img = Image.fromarray(image)
+        pil_img = Image.fromarray(image)
 
-        # # ocr识别
-        # if self.apply_ocr:
-        #     ocr_start = time.time()
-        #     # Process each area that requires OCR processing
-        #     for res in ocr_res_list:
-        #         new_image, useful_list = crop_img(res, pil_img, crop_paste_x=50, crop_paste_y=50)
-        #         paste_x, paste_y, xmin, ymin, xmax, ymax, new_width, new_height = useful_list
-        #         # Adjust the coordinates of the formula area
-        #         adjusted_mfdetrec_res = []
-        #         for mf_res in single_page_mfdetrec_res:
-        #             mf_xmin, mf_ymin, mf_xmax, mf_ymax = mf_res["bbox"]
-        #             # Adjust the coordinates of the formula area to the coordinates relative to the cropping area
-        #             x0 = mf_xmin - xmin + paste_x
-        #             y0 = mf_ymin - ymin + paste_y
-        #             x1 = mf_xmax - xmin + paste_x
-        #             y1 = mf_ymax - ymin + paste_y
-        #             # Filter formula blocks outside the graph
-        #             if any([x1 < 0, y1 < 0]) or any([x0 > new_width, y0 > new_height]):
-        #                 continue
-        #             else:
-        #                 adjusted_mfdetrec_res.append({
-        #                     "bbox": [x0, y0, x1, y1],
-        #                 })
+        # ocr识别
+        if self.apply_ocr:
+            ocr_start = time.time()
+            # Process each area that requires OCR processing
+            for res in ocr_res_list:
+                new_image, useful_list = crop_img(res, pil_img, crop_paste_x=50, crop_paste_y=50)
+                paste_x, paste_y, xmin, ymin, xmax, ymax, new_width, new_height = useful_list
+                # Adjust the coordinates of the formula area
+                adjusted_mfdetrec_res = []
+                for mf_res in single_page_mfdetrec_res:
+                    mf_xmin, mf_ymin, mf_xmax, mf_ymax = mf_res["bbox"]
+                    # Adjust the coordinates of the formula area to the coordinates relative to the cropping area
+                    x0 = mf_xmin - xmin + paste_x
+                    y0 = mf_ymin - ymin + paste_y
+                    x1 = mf_xmax - xmin + paste_x
+                    y1 = mf_ymax - ymin + paste_y
+                    # Filter formula blocks outside the graph
+                    if any([x1 < 0, y1 < 0]) or any([x0 > new_width, y0 > new_height]):
+                        continue
+                    else:
+                        adjusted_mfdetrec_res.append({
+                            "bbox": [x0, y0, x1, y1],
+                        })
 
-        #         # OCR recognition
-        #         new_image = cv2.cvtColor(np.asarray(new_image), cv2.COLOR_RGB2BGR)
-        #         ocr_res = self.ocr_model.ocr(new_image, mfd_res=adjusted_mfdetrec_res)[0]
+                # OCR recognition
+                new_image = cv2.cvtColor(np.asarray(new_image), cv2.COLOR_RGB2BGR)
+                ocr_res = self.ocr_model.ocr(new_image, mfd_res=adjusted_mfdetrec_res)[0]
 
-        #         # Integration results
-        #         if ocr_res:
-        #             for box_ocr_res in ocr_res:
-        #                 p1, p2, p3, p4 = box_ocr_res[0]
-        #                 text, score = box_ocr_res[1]
+                # Integration results
+                if ocr_res:
+                    for box_ocr_res in ocr_res:
+                        p1, p2, p3, p4 = box_ocr_res[0]
+                        text, score = box_ocr_res[1]
 
-        #                 # Convert the coordinates back to the original coordinate system
-        #                 p1 = [p1[0] - paste_x + xmin, p1[1] - paste_y + ymin]
-        #                 p2 = [p2[0] - paste_x + xmin, p2[1] - paste_y + ymin]
-        #                 p3 = [p3[0] - paste_x + xmin, p3[1] - paste_y + ymin]
-        #                 p4 = [p4[0] - paste_x + xmin, p4[1] - paste_y + ymin]
+                        # Convert the coordinates back to the original coordinate system
+                        p1 = [p1[0] - paste_x + xmin, p1[1] - paste_y + ymin]
+                        p2 = [p2[0] - paste_x + xmin, p2[1] - paste_y + ymin]
+                        p3 = [p3[0] - paste_x + xmin, p3[1] - paste_y + ymin]
+                        p4 = [p4[0] - paste_x + xmin, p4[1] - paste_y + ymin]
 
-        #                 layout_res.append({
-        #                     'category_id': 15,
-        #                     'poly': p1 + p2 + p3 + p4,
-        #                     'score': round(score, 2),
-        #                     'text': text,
-        #                 })
+                        layout_res.append({
+                            'category_id': 15,
+                            'poly': p1 + p2 + p3 + p4,
+                            'score': round(score, 2),
+                            'text': text,
+                        })
 
-        #     ocr_cost = round(time.time() - ocr_start, 2)
-        #     logger.info(f"ocr cost: {ocr_cost}")
+            ocr_cost = round(time.time() - ocr_start, 2)
+            logger.info(f"ocr cost: {ocr_cost}")
 
-        # # 表格识别 table recognition
-        # if self.apply_table:
-        #     table_start = time.time()
-        #     for res in table_res_list:
-        #         new_image, _ = crop_img(res, pil_img)
-        #         single_table_start_time = time.time()
-        #         logger.info("------------------table recognition processing begins-----------------")
-        #         latex_code = None
-        #         html_code = None
-        #         with torch.no_grad():
-        #             if self.table_model_type == STRUCT_EQTABLE:
-        #                 latex_code = self.table_model.image2latex(new_image)[0]
-        #             else:
-        #                 html_code = self.table_model.img2html(new_image)
-        #         run_time = time.time() - single_table_start_time
-        #         logger.info(f"------------table recognition processing ends within {run_time}s-----")
-        #         if run_time > self.table_max_time:
-        #             logger.warning(f"------------table recognition processing exceeds max time {self.table_max_time}s----------")
-        #         # 判断是否返回正常
+        # 表格识别 table recognition
+        if self.apply_table:
+            table_start = time.time()
+            for res in table_res_list:
+                new_image, _ = crop_img(res, pil_img)
+                single_table_start_time = time.time()
+                logger.info("------------------table recognition processing begins-----------------")
+                latex_code = None
+                html_code = None
+                if self.table_model_type == STRUCT_EQTABLE:
+                    with torch.no_grad():
+                        latex_code = self.table_model.image2latex(new_image)[0]
+                else:
+                    html_code = self.table_model.img2html(new_image)
 
-        #         if latex_code:
-        #             expected_ending = latex_code.strip().endswith('end{tabular}') or latex_code.strip().endswith(
-        #                 'end{table}')
-        #             if expected_ending:
-        #                 res["latex"] = latex_code
-        #             else:
-        #                 logger.warning(f"------------table recognition processing fails----------")
-        #         elif html_code:
-        #             res["html"] = html_code
-        #         else:
-        #             logger.warning(f"------------table recognition processing fails----------")
-        #     table_cost = round(time.time() - table_start, 2)
-        #     logger.info(f"table cost: {table_cost}")
+                run_time = time.time() - single_table_start_time
+                logger.info(f"------------table recognition processing ends within {run_time}s-----")
+                if run_time > self.table_max_time:
+                    logger.warning(f"------------table recognition processing exceeds max time {self.table_max_time}s----------")
+                # 判断是否返回正常
+
+                if latex_code:
+                    expected_ending = latex_code.strip().endswith('end{tabular}') or latex_code.strip().endswith(
+                        'end{table}')
+                    if expected_ending:
+                        res["latex"] = latex_code
+                    else:
+                        logger.warning(f"------------table recognition processing fails----------")
+                elif html_code:
+                    res["html"] = html_code
+                else:
+                    logger.warning(f"------------table recognition processing fails----------")
+            table_cost = round(time.time() - table_start, 2)
+            logger.info(f"table cost: {table_cost}")
 
         return layout_res
