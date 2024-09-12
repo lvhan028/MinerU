@@ -39,7 +39,6 @@ model_config.__use_inside_model__ = True
 #     logger.exception(e)
 
 def process(pdf_list):
-    import pdb; pdb.set_trace()
     current_script_dir = os.path.dirname(os.path.abspath(__file__))
     
     for index, pdf_path in enumerate(pdf_list):
@@ -74,7 +73,7 @@ def main(file_path: str):
     ext = file_ext(file_path)
     if ext == '.pdf':
         pdf_list.append(file_path)
-        pdf_list *= 100
+        pdf_list *= 1
     elif ext == '.txt':
         with open(file_path) as f:
             file_paths = f.readlines()
