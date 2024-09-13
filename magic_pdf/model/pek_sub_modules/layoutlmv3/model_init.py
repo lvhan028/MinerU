@@ -131,22 +131,21 @@ class Layoutlmv3_Predictor(object):
         #     "layout_dets": []
         # }
         layout_dets = []
-        
-        # outputs = self.predictor(image)
-        
+    
         # copy image transformation from `detectron2/engine/defaults.py:Defautlpredictor::__call__` 
         # to support batch inference because `Defautlpredictor::__call__` doesn't support batch inputs
         inputs = []
+        for original_image in images:
+            if self.predictor.input_format == "RGB":
+                # whether the model expects BGR inputs or RGB
+                original_image = original_image[:, :, ::-1]
+            height, width = original_image.shape[:2]
+            image = self.predictor.aug.get_transform(original_image).apply_image(original_image)
+            image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+            image.to(self.predictor.cfg.MODEL.DEVICE)
+            inputs.append({"image": image, "height": height, "width": width})
+
         with torch.no_grad():
-            for original_image in images:
-                if self.predictor.input_format == "RGB":
-                    # whether the model expects BGR inputs or RGB
-                    original_image = original_image[:, :, ::-1]
-                height, width = original_image.shape[:2]
-                image = self.predictor.aug.get_transform(original_image).apply_image(original_image)
-                image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
-                image.to(self.predictor.cfg.MODEL.DEVICE)
-                inputs.append({"image": image, "height": height, "width": width})
             outputs = self.predictor.model(inputs)
 
         for image_index, _outputs in enumerate(outputs):
